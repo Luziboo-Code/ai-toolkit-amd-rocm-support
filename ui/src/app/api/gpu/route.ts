@@ -4,6 +4,7 @@ import { promisify } from 'util';
 import os from 'os';
 import { cached } from '@/server/apiCache';
 import { loadMacstats } from '@/server/macstats';
+import { sampleAmdGpuOnce } from '@/server/amdGpu';
 
 const execAsync = promisify(exec);
 
@@ -135,9 +136,18 @@ async function getGpuInfo() {
   const hasNvidiaSmi = await checkNvidiaSmi(isWindows);
 
   if (!hasNvidiaSmi) {
+    // AMD ROCm hosts have no nvidia-smi at all. Linux is served by amd-smi;
+    // on Windows that tool does not exist either, so the HIP/PDH sampler
+    // takes over. Both report null when no AMD backend is present, which
+    // leaves the original nvidia-smi error message intact.
+    const amdGpu = await sampleAmdGpuOnce();
+    if (amdGpu) {
+      return amdGpu;
+    }
     return {
       hasNvidiaSmi: false,
       isMac: false,
+      isAMD: false,
       gpus: [],
       error: 'nvidia-smi not found or not accessible',
     };
@@ -148,6 +158,7 @@ async function getGpuInfo() {
 
   return {
     hasNvidiaSmi: true,
+    isAMD: false,
     gpus: gpuStats,
   };
 }

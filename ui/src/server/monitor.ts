@@ -3,6 +3,7 @@ import { promisify } from 'util';
 import os from 'os';
 import si from 'systeminformation';
 import { loadMacstats } from '@/server/macstats';
+import { AmdGpuWatcher } from '@/server/amdGpu';
 import { createLoadSampler, readCpuTemperature, readMemory } from '@/server/cpuStats';
 import { CpuInfo, GpuInfo, GPUApiResponse, MonitorHistoryPoint, MonitorInit, MonitorSample } from '@/types';
 import { historyPointFromSample, MONITOR_HISTORY_LENGTH, MONITOR_TICK_MS } from '@/utils/monitorSample';
@@ -91,6 +92,9 @@ class SystemMonitor {
   private latestCpu: CpuInfo | null = null;
   private latestGpu: GPUApiResponse = { hasNvidiaSmi: false, isMac: this.isMac, gpus: [] };
   private macGpuName = 'Apple GPU';
+  private amdWatcher: AmdGpuWatcher | null = null;
+  private amdEnabled = false;
+  private amdProbeInFlight = false;
   private nvChild: ChildProcess | null = null;
   private nvBatch: GpuInfo[] = [];
   private nvStdoutBuffer = '';
@@ -115,13 +119,14 @@ class SystemMonitor {
     } else {
       this.startNvLoop();
     }
-    // Never leave a resident nvidia-smi behind.
+    // Never leave a resident nvidia-smi (or AMD helper) behind.
     process.once('exit', () => {
       try {
         this.nvChild?.kill('SIGKILL');
       } catch {
         // already gone
       }
+      this.amdWatcher?.stop();
     });
     // Fixed cadence; a tick that overruns the interval (slow temperature
     // read, hung nvidia-smi one-shot) just skips beats instead of stacking.
@@ -166,6 +171,11 @@ class SystemMonitor {
     try {
       if (this.isMac) {
         this.latestGpu = this.sampleMacGpu();
+      } else if (this.amdEnabled) {
+        // The watcher samples on its own cadence - a resident helper process on
+        // Windows, a slower amd-smi poll on Linux - so just take its newest
+        // value instead of spawning anything from the tick.
+        this.latestGpu = this.amdWatcher?.latestSample ?? this.latestGpu;
       } else if (this.nvOneShotMode) {
         await this.sampleNvOneShot();
       } else {
@@ -476,6 +486,32 @@ class SystemMonitor {
       gpus: [],
       error: 'nvidia-smi not found or not accessible',
     };
+    // AMD ROCm hosts have no nvidia-smi at all. Check for AMD GPUs before
+    // leaving the UI showing an nvidia-smi error on a machine that has two
+    // perfectly good Radeons in it.
+    void this.enableAmdGpu();
+  }
+
+  private async enableAmdGpu(): Promise<void> {
+    if (this.amdEnabled || this.amdProbeInFlight) return;
+    this.amdProbeInFlight = true;
+    try {
+      const watcher = new AmdGpuWatcher(response => {
+        this.latestGpu = response;
+      }, MONITOR_TICK_MS);
+      const available = await watcher.start();
+      if (!available) {
+        watcher.stop();
+        return;
+      }
+      this.amdWatcher = watcher;
+      this.amdEnabled = true;
+      console.log('Monitor: AMD ROCm GPU sampling enabled');
+    } catch (error) {
+      console.warn('Monitor: AMD GPU probe failed:', error);
+    } finally {
+      this.amdProbeInFlight = false;
+    }
   }
 }
 

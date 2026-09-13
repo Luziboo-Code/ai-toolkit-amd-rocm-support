@@ -52,6 +52,8 @@ export interface CpuInfo {
 export interface GPUApiResponse {
   hasNvidiaSmi: boolean;
   isMac: boolean;
+  /** Set when the GPUs below were reported by the AMD ROCm sampler. */
+  isAMD?: boolean;
   gpus: GpuInfo[];
   error?: string;
 }

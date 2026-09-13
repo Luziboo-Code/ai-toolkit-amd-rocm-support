@@ -153,6 +153,91 @@ pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 
 pip install -r requirements.txt
 ```
 
+### AMD ROCm
+
+ROCm works with the same repo, using `requirements-amd.txt` instead of
+`requirements.txt`. That file is the same dependency list with the two packages
+that have no usable ROCm build removed:
+
+- `bitsandbytes` — no ROCm wheel; build it from source (below) or run without it
+- `torchcodec` — CUDA-only video decode; audio and video datasets fall back to `av`
+
+Install ROCm first, following [rocm.docs.amd.com](https://rocm.docs.amd.com).
+ROCm 7.1.1 and 7.2 are confirmed to work; older releases may report different
+`amd-smi` output. Install the ROCm build of PyTorch for your ROCm version
+*before* the requirements file, since `torch` is deliberately not pinned here.
+
+Linux:
+```bash
+git clone https://github.com/Luziboo-Code/ai-toolkit-amd-rocm-support.git
+cd ai-toolkit-amd-rocm-support
+python3 -m venv venv
+source venv/bin/activate
+# install torch first - rocm7.1 compatible
+pip install --pre torch torchvision torchaudio torchao --index-url https://download.pytorch.org/whl/nightly/rocm7.1
+pip install -r requirements-amd.txt
+```
+
+Windows (ROCm 7.x):
+```bash
+git clone https://github.com/Luziboo-Code/ai-toolkit-amd-rocm-support.git
+cd ai-toolkit-amd-rocm-support
+python -m venv venv
+.\venv\Scripts\activate
+# ROCm wheels for Radeon on Windows. gfx1201 covers the RX 9070 / 9070 XT and
+# the Radeon AI PRO R9700; other cards find their family in the rocm-sdk-*
+# packages listed by `pip index versions rocm-sdk-device-<arch>`.
+# Keep this on ONE line: bash-style "\" line continuations are not accepted by
+# PowerShell or cmd, and the failure is silent - you are simply left with the
+# CPU build of torch, which never sees the GPUs.
+python -m pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "torch[device-gfx1201]==2.12.0+rocm7.14.0" "torchvision[device-gfx1201]==0.27.0+rocm7.14.0" "torchaudio==2.11.0+rocm7.14.0"
+# expect: 2.12.0+rocm7.14.0 7.14.x True 2
+python -c "import torch; print(torch.__version__, torch.version.hip, torch.cuda.is_available(), torch.cuda.device_count())"
+pip install -r requirements-amd.txt
+```
+
+If `pip install -r requirements-amd.txt` fails on the `git+https://.../diffusers.git`
+line with `Connection was reset` or a connect timeout (common on restricted
+networks), install that exact commit from GitHub's archive instead - it is a
+single download rather than a partial clone plus a follow-up fetch:
+
+```bash
+python -m pip install https://codeload.github.com/huggingface/diffusers/tar.gz/c943837899b16cbae2f619b8dd4f7bb6f07dd81a
+```
+
+AI Toolkit requires bitsandbytes. There is no ROCm wheel, so it has to be built:
+```bash
+git clone https://github.com/bitsandbytes-foundation/bitsandbytes.git -b 0.48.2
+cd bitsandbytes
+# replace gfx1201 by the arch for your GPU (hipInfo, or `amd-smi static | grep gfx`)
+cmake -DCMAKE_HIP_COMPILER="/opt/rocm-7.1.1/lib/llvm/bin/clang++" -DBNB_ROCM_ARCH="gfx1201" -DCOMPUTE_BACKEND=hip .
+make -j32
+pip install .
+```
+
+#### GPU monitor on AMD
+
+The UI reports AMD GPUs on both platforms, but the two platforms are read
+differently and do not show the same fields:
+
+| | Linux / WSL | Windows |
+| --- | --- | --- |
+| Source | `amd-smi` | HIP runtime + Windows GPU counters |
+| Name, VRAM, utilization | yes | yes |
+| Temperature, power, fan, clocks | yes | not available |
+
+ROCm for Windows ships neither `amd-smi` nor `rocm-smi` (and installs no AMD
+telemetry library), so on Windows the UI reads device identity, total/free VRAM
+and per-card utilization from the HIP runtime, the PDH GPU engine counters and
+D3DKMT instead. Those sources carry no thermal or power data, so temperature,
+power, fan speed and clocks show as `0` on Windows rather than a made-up value.
+
+The Windows sampler runs as a small Python helper (standard library only, so
+any Python 3.10+ interpreter works — set `AI_TOOLKIT_PYTHON` to pin a specific
+interpreter). GPU indices are the HIP device order, which is the same order
+PyTorch uses for `--gpu-ids`, so the GPU you pick in the UI is the GPU training
+will use.
+
 
 # AI Toolkit UI
 
