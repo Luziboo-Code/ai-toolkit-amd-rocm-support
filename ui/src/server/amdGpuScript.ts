@@ -50,6 +50,7 @@ import time
 PDH_FMT_DOUBLE = 0x00000200
 PDH_CSTATUS_VALID_DATA = 0x00000000
 GPU_ENGINE_COUNTER = r"\GPU Engine(*)\Utilization Percentage"
+GPU_ADAPTER_MEMORY_COUNTER = r"\GPU Adapter Memory(*)\Dedicated Usage"
 KMTQAITYPE_ADAPTERADDRESS = 6
 VIDEO_CLASS_KEY = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
@@ -162,11 +163,16 @@ class _PdhCounterValueItem(ctypes.Structure):
 
 
 def luid_and_engine(instance):
-    """Split "..._luid_0x00000000_0x00014E15_phys_0_eng_0_engtype_3D"."""
-    start = instance.find("_luid_")
+    """Split "..._luid_0x00000000_0x00014E15_phys_0_eng_0_engtype_3D".
+
+    Engine instances are prefixed with "pid_<n>_"; adapter memory instances
+    start straight at "luid_", so search for the marker without the leading
+    underscore.
+    """
+    start = instance.find("luid_")
     if start < 0:
         return None, None
-    parts = instance[start + len("_luid_"):].split("_")
+    parts = instance[start + len("luid_"):].split("_")
     if len(parts) < 2:
         return None, None
     engine = None
@@ -183,13 +189,40 @@ class EngineCounters(object):
         self.pdh = ctypes.WinDLL("pdh")
         self.query = ctypes.c_void_p()
         self.counter = ctypes.c_void_p()
+        self.memory_counter = None
         self.primed = False
         if self.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.query)) != 0:
             raise OSError("PdhOpenQuery failed")
-        # The English counter name resolves on localized Windows too; the
+        # The English counter names resolve on localized Windows too; the
         # localized PdhAddCounter would not.
         if self.pdh.PdhAddEnglishCounterW(self.query, GPU_ENGINE_COUNTER, 0, ctypes.byref(self.counter)) != 0:
             raise OSError("the GPU Engine counters are unavailable")
+        memory_counter = ctypes.c_void_p()
+        if self.pdh.PdhAddEnglishCounterW(
+                self.query, GPU_ADAPTER_MEMORY_COUNTER, 0, ctypes.byref(memory_counter)) == 0:
+            self.memory_counter = memory_counter
+        else:
+            log("the GPU Adapter Memory counters are unavailable")
+
+    def _formatted_array(self, counter):
+        """[(instance name, value)] for one counter, dropping invalid samples."""
+        size = wt.DWORD(0)
+        count = wt.DWORD(0)
+        self.pdh.PdhGetFormattedCounterArrayW(
+            counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), None)
+        if size.value == 0 or count.value == 0:
+            return []
+        buffer = ctypes.create_string_buffer(size.value)
+        if self.pdh.PdhGetFormattedCounterArrayW(
+                counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), buffer) != 0:
+            return []
+        items = ctypes.cast(buffer, ctypes.POINTER(_PdhCounterValueItem))
+        rows = []
+        for position in range(count.value):
+            item = items[position]
+            if item.FmtValue.CStatus == PDH_CSTATUS_VALID_DATA:
+                rows.append((item.szName or "", item.FmtValue.doubleValue))
+        return rows
 
     def collect(self):
         """{luid: percent}, the busiest engine of each adapter."""
@@ -200,26 +233,11 @@ class EngineCounters(object):
             self.primed = True
         if self.pdh.PdhCollectQueryData(self.query) != 0:
             return {}
-        size = wt.DWORD(0)
-        count = wt.DWORD(0)
-        self.pdh.PdhGetFormattedCounterArrayW(
-            self.counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), None)
-        if size.value == 0 or count.value == 0:
-            return {}
-        buffer = ctypes.create_string_buffer(size.value)
-        if self.pdh.PdhGetFormattedCounterArrayW(
-                self.counter, PDH_FMT_DOUBLE, ctypes.byref(size), ctypes.byref(count), buffer) != 0:
-            return {}
-        items = ctypes.cast(buffer, ctypes.POINTER(_PdhCounterValueItem))
         per_engine = {}
-        for position in range(count.value):
-            item = items[position]
-            if item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA:
-                continue
-            value = item.FmtValue.doubleValue
+        for name, value in self._formatted_array(self.counter):
             if value <= 0:
                 continue
-            luid, engine = luid_and_engine(item.szName or "")
+            luid, engine = luid_and_engine(name)
             if luid is None:
                 continue
             key = (luid, engine or "unknown")
@@ -232,6 +250,26 @@ class EngineCounters(object):
             busiest = min(value, 100.0)
             if busiest > per_luid.get(luid, 0.0):
                 per_luid[luid] = busiest
+        return per_luid
+
+    def collect_memory(self):
+        """{luid: dedicated VRAM in MiB} per adapter.
+
+        hipMemGetInfo only accounts for the calling process, so it reports a
+        training job running in another process as ~0. This driver-side counter
+        is the one that sees the whole device. Call after collect() so both
+        counters are read from the same query sample.
+        """
+        if self.memory_counter is None:
+            return {}
+        per_luid = {}
+        for name, value in self._formatted_array(self.memory_counter):
+            if value <= 0:
+                continue
+            luid, _engine = luid_and_engine(name)
+            if luid is None:
+                continue
+            per_luid[luid] = per_luid.get(luid, 0.0) + value / BYTES_PER_MIB
         return per_luid
 
 
@@ -348,16 +386,21 @@ def driver_version_for(name, versions):
 # ---------------------------------------------------------------------------
 # Sampling
 # ---------------------------------------------------------------------------
+def bus_for(high, low):
+    try:
+        return luid_to_bus(int(high, 16), int(low, 16))
+    except ValueError:
+        return None
+
+
 def build_sample(counters, versions):
     devices = read_hip_devices()
     utilization = {}
+    dedicated = {}
     if counters is not None:
         try:
             for (high, low), percent in counters.collect().items():
-                try:
-                    bus = luid_to_bus(int(high, 16), int(low, 16))
-                except ValueError:
-                    bus = None
+                bus = bus_for(high, low)
                 if bus is None:
                     continue
                 if percent > utilization.get(bus, 0.0):
@@ -365,20 +408,33 @@ def build_sample(counters, versions):
         except Exception as exc:
             # Utilization is a nice-to-have; memory stats still matter.
             log("gpu engine counters failed: " + str(exc))
+        try:
+            for (high, low), mib in counters.collect_memory().items():
+                bus = bus_for(high, low)
+                if bus is None:
+                    continue
+                dedicated[bus] = dedicated.get(bus, 0.0) + mib
+        except Exception as exc:
+            log("gpu adapter memory counters failed: " + str(exc))
 
     gpus = []
     for device in devices:
         total = device["totalMiB"]
-        free = device["freeMiB"]
-        used = total - free if total > 0 and free <= total else 0.0
         bus = device["pciBus"]
+        hip_free = device["freeMiB"]
+        hip_used = total - hip_free if total > 0 and hip_free <= total else 0.0
+        # Prefer the device-wide counter over HIP, which only sees this
+        # process: with a training job in another process HIP reports ~0.
+        used = dedicated.get(bus, hip_used) if bus is not None else hip_used
+        used = max(min(used, total), 0.0)
+        free = max(total - used, 0.0)
         gpus.append({
             "index": device["index"],
             "name": device["name"],
             "driverVersion": driver_version_for(device["name"], versions),
             "pciBus": bus,
             "totalMiB": total,
-            "freeMiB": free,
+            "freeMiB": round(free, 1),
             "usedMiB": round(used, 1),
             "utilizationGpu": round(utilization.get(bus, 0.0), 1) if bus is not None else 0.0,
         })
